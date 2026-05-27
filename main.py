@@ -17,10 +17,11 @@ TRAIN_LOG_FIELDNAMES = [
     "iou_foreground",
     "iou_background",
     "iou_boundary",
-    "learning_rate",
+    "current_lr",
     "loss_type",
     "ce_weight",
     "dice_weight",
+    "scheduler",
     "is_best",
 ]
 
@@ -274,6 +275,11 @@ def parse_args():
     parser.add_argument("--loss", type=str, default="ce_dice", choices=["ce", "ce_dice"])
     parser.add_argument("--ce-weight", type=float, default=1.0)
     parser.add_argument("--dice-weight", type=float, default=1.0)
+    parser.add_argument("--scheduler", type=str, default="plateau", choices=["none", "plateau"])
+    parser.add_argument("--plateau-factor", type=float, default=0.5)
+    parser.add_argument("--plateau-patience", type=int, default=2)
+    parser.add_argument("--plateau-threshold", type=float, default=1e-4)
+    parser.add_argument("--min-lr", type=float, default=1e-6)
     return parser.parse_args()
 
 
@@ -302,6 +308,24 @@ def resolve_log_path(log_path: str) -> str:
         version += 1
 
 
+def get_current_lr(optimizer: optim.Optimizer) -> float:
+    return optimizer.param_groups[0]["lr"]
+
+
+def build_scheduler(optimizer: optim.Optimizer, args):
+    if args.scheduler == "none":
+        return None
+
+    return optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=args.plateau_factor,
+        patience=args.plateau_patience,
+        threshold=args.plateau_threshold,
+        min_lr=args.min_lr,
+    )
+
+
 def build_checkpoint(
     epoch: int,
     model: nn.Module,
@@ -318,6 +342,13 @@ def build_checkpoint(
     loss_type: str,
     ce_weight: float,
     dice_weight: float,
+    scheduler_type: str,
+    scheduler_state_dict,
+    current_lr: float,
+    plateau_factor: float,
+    plateau_patience: int,
+    plateau_threshold: float,
+    min_lr: float,
 ):
     return {
         "epoch": epoch,
@@ -335,6 +366,13 @@ def build_checkpoint(
         "loss_type": loss_type,
         "ce_weight": ce_weight,
         "dice_weight": dice_weight,
+        "scheduler_type": scheduler_type,
+        "scheduler_state_dict": scheduler_state_dict,
+        "current_lr": current_lr,
+        "plateau_factor": plateau_factor,
+        "plateau_patience": plateau_patience,
+        "plateau_threshold": plateau_threshold,
+        "min_lr": min_lr,
     }
 
 
@@ -345,10 +383,11 @@ def append_train_log(
     val_loss: float,
     val_miou: float,
     class_ious,
-    learning_rate: float,
+    current_lr: float,
     loss_type: str,
     ce_weight: float,
     dice_weight: float,
+    scheduler_type: str,
     is_best: bool,
 ) -> None:
     needs_header = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
@@ -366,10 +405,11 @@ def append_train_log(
                 "iou_foreground": class_ious[0],
                 "iou_background": class_ious[1],
                 "iou_boundary": class_ious[2],
-                "learning_rate": learning_rate,
+                "current_lr": current_lr,
                 "loss_type": loss_type,
                 "ce_weight": ce_weight,
                 "dice_weight": dice_weight,
+                "scheduler": scheduler_type,
                 "is_best": is_best,
             }
         )
@@ -388,13 +428,14 @@ def main():
     loss_type = args.loss
     ce_weight = args.ce_weight
     dice_weight = args.dice_weight
+    scheduler_type = args.scheduler
     model_name = "basic_unet"
     max_train_batches = 5 if args.quick else None
     max_val_batches = 2 if args.quick else None
     mode = "quick debug" if args.quick else "full training"
     best_checkpoint_path = os.path.join(checkpoint_dir, "best_unet.pth")
     last_checkpoint_path = os.path.join(checkpoint_dir, "last_unet.pth")
-    log_path = os.path.join(log_dir, f"train_log_{loss_type}.csv")
+    log_path = os.path.join(log_dir, f"train_log_{loss_type}_{scheduler_type}.csv")
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
@@ -409,6 +450,7 @@ def main():
         num_classes=num_classes,
     )
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = build_scheduler(optimizer, args)
     trainer = Trainer(model, criterion, optimizer, device, num_classes=num_classes)
     best_miou = -1.0
 
@@ -421,6 +463,11 @@ def main():
     print(f"loss_type: {loss_type}")
     print(f"ce_weight: {ce_weight}")
     print(f"dice_weight: {dice_weight}")
+    print(f"scheduler: {scheduler_type}")
+    print(f"plateau_factor: {args.plateau_factor}")
+    print(f"plateau_patience: {args.plateau_patience}")
+    print(f"plateau_threshold: {args.plateau_threshold}")
+    print(f"min_lr: {args.min_lr}")
     print(f"checkpoint_dir: {display_path(checkpoint_dir)}")
     print(f"log_dir: {display_path(log_dir)}")
     print(f"log_file: {display_path(log_path)}")
@@ -433,6 +480,12 @@ def main():
         is_best = val_miou > best_miou
         if is_best:
             best_miou = val_miou
+
+        old_lr = get_current_lr(optimizer)
+        if scheduler is not None:
+            scheduler.step(val_miou)
+        current_lr = get_current_lr(optimizer)
+        lr_reduced = old_lr > current_lr
 
         checkpoint = build_checkpoint(
             epoch=epoch + 1,
@@ -450,19 +503,29 @@ def main():
             loss_type=loss_type,
             ce_weight=ce_weight,
             dice_weight=dice_weight,
+            scheduler_type=scheduler_type,
+            scheduler_state_dict=scheduler.state_dict() if scheduler is not None else None,
+            current_lr=current_lr,
+            plateau_factor=args.plateau_factor,
+            plateau_patience=args.plateau_patience,
+            plateau_threshold=args.plateau_threshold,
+            min_lr=args.min_lr,
         )
 
         print(
             f"[Epoch {epoch + 1}/{num_epochs}] "
             f"train_loss={train_loss:.4f} "
             f"val_loss={val_loss:.4f} "
-            f"val_mIoU={format_metric(val_miou)}"
+            f"val_mIoU={format_metric(val_miou)} "
+            f"lr={current_lr:.6f}"
         )
         class_iou_text = " ".join(
             f"{class_name}={format_metric(class_iou)}"
             for class_name, class_iou in zip(CLASS_NAMES, class_ious)
         )
         print(f"class IoU: {class_iou_text}")
+        if lr_reduced:
+            print(f"Learning rate reduced: {old_lr:.6f} -> {current_lr:.6f}")
 
         if is_best:
             torch.save(checkpoint, best_checkpoint_path)
@@ -481,10 +544,11 @@ def main():
             val_loss=val_loss,
             val_miou=val_miou,
             class_ious=class_ious,
-            learning_rate=learning_rate,
+            current_lr=current_lr,
             loss_type=loss_type,
             ce_weight=ce_weight,
             dice_weight=dice_weight,
+            scheduler_type=scheduler_type,
             is_best=is_best,
         )
 
