@@ -1,3 +1,5 @@
+import argparse
+import csv
 import os
 
 import torch
@@ -205,6 +207,20 @@ def format_metric(value: float) -> str:
     return "nan" if value != value else f"{value:.4f}"
 
 
+def display_path(path: str) -> str:
+    return path.replace("\\", "/")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a basic U-Net for Oxford-IIIT Pet segmentation.")
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument("--log-dir", type=str, default="logs")
+    return parser.parse_args()
+
+
 def build_checkpoint(
     epoch: int,
     model: nn.Module,
@@ -235,23 +251,68 @@ def build_checkpoint(
     }
 
 
+def append_train_log(
+    log_path: str,
+    epoch: int,
+    train_loss: float,
+    val_loss: float,
+    val_miou: float,
+    class_ious,
+    learning_rate: float,
+    is_best: bool,
+) -> None:
+    fieldnames = [
+        "epoch",
+        "train_loss",
+        "val_loss",
+        "val_miou",
+        "iou_foreground",
+        "iou_background",
+        "iou_boundary",
+        "learning_rate",
+        "is_best",
+    ]
+    needs_header = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
+
+    with open(log_path, mode="a", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        if needs_header:
+            writer.writeheader()
+        writer.writerow(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_miou": val_miou,
+                "iou_foreground": class_ious[0],
+                "iou_background": class_ious[1],
+                "iou_boundary": class_ious[2],
+                "learning_rate": learning_rate,
+                "is_best": is_best,
+            }
+        )
+
+
 def main():
+    args = parse_args()
     set_seed(RANDOM_SEED)
 
-    from data import train_loader, val_loader
-
     num_classes = 3
-    num_epochs = 1
-    learning_rate = 1e-4
     image_size = 224
+    num_epochs = args.epochs
+    learning_rate = args.lr
+    checkpoint_dir = args.checkpoint_dir
+    log_dir = args.log_dir
     model_name = "basic_unet"
-    max_train_batches = 5
-    max_val_batches = 2
-    checkpoint_dir = "checkpoints"
-    best_checkpoint_path = "checkpoints/best_unet.pth"
-    last_checkpoint_path = "checkpoints/last_unet.pth"
+    max_train_batches = 5 if args.quick else None
+    max_val_batches = 2 if args.quick else None
+    mode = "quick debug" if args.quick else "full training"
+    best_checkpoint_path = os.path.join(checkpoint_dir, "best_unet.pth")
+    last_checkpoint_path = os.path.join(checkpoint_dir, "last_unet.pth")
+    log_path = os.path.join(log_dir, "train_log.csv")
 
     os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = UNet(in_channels=3, num_classes=num_classes).to(device)
@@ -262,18 +323,27 @@ def main():
 
     trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     print(f"device: {device}")
+    print(f"mode: {mode}")
     print(f"total trainable parameters: {trainable_params:,}")
     print(f"num_epochs: {num_epochs}")
     print(f"learning_rate: {learning_rate}")
+    print(f"checkpoint_dir: {display_path(checkpoint_dir)}")
+    print(f"log_dir: {display_path(log_dir)}")
+
+    from data import train_loader, val_loader
 
     for epoch in range(num_epochs):
         train_loss = trainer.train_one_epoch(train_loader, max_batches=max_train_batches)
         val_loss, val_miou, class_ious = trainer.validate(val_loader, max_batches=max_val_batches)
+        is_best = val_miou > best_miou
+        if is_best:
+            best_miou = val_miou
+
         checkpoint = build_checkpoint(
             epoch=epoch + 1,
             model=model,
             optimizer=optimizer,
-            best_miou=max(best_miou, val_miou),
+            best_miou=best_miou,
             val_miou=val_miou,
             val_loss=val_loss,
             class_ious=class_ious,
@@ -296,15 +366,26 @@ def main():
         )
         print(f"class IoU: {class_iou_text}")
 
-        if val_miou > best_miou:
-            best_miou = val_miou
-            checkpoint["best_miou"] = best_miou
+        if is_best:
             torch.save(checkpoint, best_checkpoint_path)
-            print(f"New best model saved: {best_checkpoint_path} (val_mIoU={format_metric(val_miou)})")
+            print(
+                f"New best model saved: {display_path(best_checkpoint_path)} "
+                f"(val_mIoU={format_metric(val_miou)})"
+            )
 
-        checkpoint["best_miou"] = best_miou
         torch.save(checkpoint, last_checkpoint_path)
-        print(f"Last checkpoint saved: {last_checkpoint_path}")
+        print(f"Last checkpoint saved: {display_path(last_checkpoint_path)}")
+
+        append_train_log(
+            log_path=log_path,
+            epoch=epoch + 1,
+            train_loss=train_loss,
+            val_loss=val_loss,
+            val_miou=val_miou,
+            class_ious=class_ious,
+            learning_rate=learning_rate,
+            is_best=is_best,
+        )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 dataset/
 oxford_pet_data/
 checkpoints/
+logs/
 *.pt
 *.pth
 __pycache__/
