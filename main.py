@@ -9,6 +9,20 @@ import torch.nn.functional as F
 
 RANDOM_SEED = 42
 CLASS_NAMES = ("foreground", "background", "boundary")
+TRAIN_LOG_FIELDNAMES = [
+    "epoch",
+    "train_loss",
+    "val_loss",
+    "val_miou",
+    "iou_foreground",
+    "iou_background",
+    "iou_boundary",
+    "learning_rate",
+    "loss_type",
+    "ce_weight",
+    "dice_weight",
+    "is_best",
+]
 
 
 class DoubleConv(nn.Module):
@@ -86,15 +100,54 @@ class UNet(nn.Module):
         return self.final_conv(x)
 
 
-class SegmentationLoss(nn.Module):
-    """Cross entropy loss for multi-class semantic segmentation."""
+class DiceLoss(nn.Module):
+    """Multi-class Dice loss computed from raw segmentation logits."""
 
-    def __init__(self):
+    def __init__(self, num_classes: int, smooth: float = 1e-6):
         super().__init__()
-        self.loss_fn = nn.CrossEntropyLoss()
+        self.num_classes = num_classes
+        self.smooth = smooth
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return self.loss_fn(logits, targets)
+        probs = torch.softmax(logits, dim=1)
+        targets_one_hot = F.one_hot(targets.long(), num_classes=self.num_classes)
+        targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float()
+
+        dims = (0, 2, 3)
+        intersections = torch.sum(probs * targets_one_hot, dim=dims)
+        pred_sums = torch.sum(probs, dim=dims)
+        target_sums = torch.sum(targets_one_hot, dim=dims)
+        dice_scores = (2.0 * intersections + self.smooth) / (pred_sums + target_sums + self.smooth)
+
+        return 1.0 - dice_scores.mean()
+
+
+class SegmentationLoss(nn.Module):
+    """Cross entropy or combined cross entropy and Dice loss."""
+
+    def __init__(
+        self,
+        loss_type: str = "ce_dice",
+        ce_weight: float = 1.0,
+        dice_weight: float = 1.0,
+        num_classes: int = 3,
+    ):
+        super().__init__()
+        if loss_type not in {"ce", "ce_dice"}:
+            raise ValueError(f"Unsupported loss_type: {loss_type}")
+        self.loss_type = loss_type
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.dice_loss = DiceLoss(num_classes=num_classes)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = self.ce_loss(logits, targets)
+        if self.loss_type == "ce":
+            return ce
+
+        dice = self.dice_loss(logits, targets)
+        return self.ce_weight * ce + self.dice_weight * dice
 
 
 def compute_iou_stats(preds: torch.Tensor, targets: torch.Tensor, num_classes: int):
@@ -218,7 +271,35 @@ def parse_args():
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--log-dir", type=str, default="logs")
+    parser.add_argument("--loss", type=str, default="ce_dice", choices=["ce", "ce_dice"])
+    parser.add_argument("--ce-weight", type=float, default=1.0)
+    parser.add_argument("--dice-weight", type=float, default=1.0)
     return parser.parse_args()
+
+
+def resolve_log_path(log_path: str) -> str:
+    if not os.path.exists(log_path) or os.path.getsize(log_path) == 0:
+        return log_path
+
+    with open(log_path, mode="r", newline="") as csv_file:
+        reader = csv.reader(csv_file)
+        existing_header = next(reader, [])
+
+    if existing_header == TRAIN_LOG_FIELDNAMES:
+        return log_path
+
+    base, ext = os.path.splitext(log_path)
+    version = 2
+    while True:
+        candidate = f"{base}_v{version}{ext}"
+        if not os.path.exists(candidate) or os.path.getsize(candidate) == 0:
+            return candidate
+        with open(candidate, mode="r", newline="") as csv_file:
+            reader = csv.reader(csv_file)
+            existing_header = next(reader, [])
+        if existing_header == TRAIN_LOG_FIELDNAMES:
+            return candidate
+        version += 1
 
 
 def build_checkpoint(
@@ -234,6 +315,9 @@ def build_checkpoint(
     num_epochs: int,
     model_name: str,
     image_size: int,
+    loss_type: str,
+    ce_weight: float,
+    dice_weight: float,
 ):
     return {
         "epoch": epoch,
@@ -248,6 +332,9 @@ def build_checkpoint(
         "num_epochs": num_epochs,
         "model_name": model_name,
         "image_size": image_size,
+        "loss_type": loss_type,
+        "ce_weight": ce_weight,
+        "dice_weight": dice_weight,
     }
 
 
@@ -259,23 +346,15 @@ def append_train_log(
     val_miou: float,
     class_ious,
     learning_rate: float,
+    loss_type: str,
+    ce_weight: float,
+    dice_weight: float,
     is_best: bool,
 ) -> None:
-    fieldnames = [
-        "epoch",
-        "train_loss",
-        "val_loss",
-        "val_miou",
-        "iou_foreground",
-        "iou_background",
-        "iou_boundary",
-        "learning_rate",
-        "is_best",
-    ]
     needs_header = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
 
     with open(log_path, mode="a", newline="") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer = csv.DictWriter(csv_file, fieldnames=TRAIN_LOG_FIELDNAMES)
         if needs_header:
             writer.writeheader()
         writer.writerow(
@@ -288,6 +367,9 @@ def append_train_log(
                 "iou_background": class_ious[1],
                 "iou_boundary": class_ious[2],
                 "learning_rate": learning_rate,
+                "loss_type": loss_type,
+                "ce_weight": ce_weight,
+                "dice_weight": dice_weight,
                 "is_best": is_best,
             }
         )
@@ -303,20 +385,29 @@ def main():
     learning_rate = args.lr
     checkpoint_dir = args.checkpoint_dir
     log_dir = args.log_dir
+    loss_type = args.loss
+    ce_weight = args.ce_weight
+    dice_weight = args.dice_weight
     model_name = "basic_unet"
     max_train_batches = 5 if args.quick else None
     max_val_batches = 2 if args.quick else None
     mode = "quick debug" if args.quick else "full training"
     best_checkpoint_path = os.path.join(checkpoint_dir, "best_unet.pth")
     last_checkpoint_path = os.path.join(checkpoint_dir, "last_unet.pth")
-    log_path = os.path.join(log_dir, "train_log.csv")
+    log_path = os.path.join(log_dir, f"train_log_{loss_type}.csv")
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
+    log_path = resolve_log_path(log_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = UNet(in_channels=3, num_classes=num_classes).to(device)
-    criterion = SegmentationLoss()
+    criterion = SegmentationLoss(
+        loss_type=loss_type,
+        ce_weight=ce_weight,
+        dice_weight=dice_weight,
+        num_classes=num_classes,
+    )
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     trainer = Trainer(model, criterion, optimizer, device, num_classes=num_classes)
     best_miou = -1.0
@@ -327,8 +418,12 @@ def main():
     print(f"total trainable parameters: {trainable_params:,}")
     print(f"num_epochs: {num_epochs}")
     print(f"learning_rate: {learning_rate}")
+    print(f"loss_type: {loss_type}")
+    print(f"ce_weight: {ce_weight}")
+    print(f"dice_weight: {dice_weight}")
     print(f"checkpoint_dir: {display_path(checkpoint_dir)}")
     print(f"log_dir: {display_path(log_dir)}")
+    print(f"log_file: {display_path(log_path)}")
 
     from data import train_loader, val_loader
 
@@ -352,6 +447,9 @@ def main():
             num_epochs=num_epochs,
             model_name=model_name,
             image_size=image_size,
+            loss_type=loss_type,
+            ce_weight=ce_weight,
+            dice_weight=dice_weight,
         )
 
         print(
@@ -384,6 +482,9 @@ def main():
             val_miou=val_miou,
             class_ious=class_ious,
             learning_rate=learning_rate,
+            loss_type=loss_type,
+            ce_weight=ce_weight,
+            dice_weight=dice_weight,
             is_best=is_best,
         )
 
