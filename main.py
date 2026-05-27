@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -203,22 +205,60 @@ def format_metric(value: float) -> str:
     return "nan" if value != value else f"{value:.4f}"
 
 
+def build_checkpoint(
+    epoch: int,
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    best_miou: float,
+    val_miou: float,
+    val_loss: float,
+    class_ious,
+    num_classes: int,
+    learning_rate: float,
+    num_epochs: int,
+    model_name: str,
+    image_size: int,
+):
+    return {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_miou": best_miou,
+        "val_miou": val_miou,
+        "val_loss": val_loss,
+        "class_ious": class_ious,
+        "num_classes": num_classes,
+        "learning_rate": learning_rate,
+        "num_epochs": num_epochs,
+        "model_name": model_name,
+        "image_size": image_size,
+    }
+
+
 def main():
     set_seed(RANDOM_SEED)
 
     from data import train_loader, val_loader
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_classes = 3
     num_epochs = 1
     learning_rate = 1e-4
+    image_size = 224
+    model_name = "basic_unet"
     max_train_batches = 5
     max_val_batches = 2
+    checkpoint_dir = "checkpoints"
+    best_checkpoint_path = "checkpoints/best_unet.pth"
+    last_checkpoint_path = "checkpoints/last_unet.pth"
 
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = UNet(in_channels=3, num_classes=num_classes).to(device)
     criterion = SegmentationLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     trainer = Trainer(model, criterion, optimizer, device, num_classes=num_classes)
+    best_miou = -1.0
 
     trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     print(f"device: {device}")
@@ -229,6 +269,21 @@ def main():
     for epoch in range(num_epochs):
         train_loss = trainer.train_one_epoch(train_loader, max_batches=max_train_batches)
         val_loss, val_miou, class_ious = trainer.validate(val_loader, max_batches=max_val_batches)
+        checkpoint = build_checkpoint(
+            epoch=epoch + 1,
+            model=model,
+            optimizer=optimizer,
+            best_miou=max(best_miou, val_miou),
+            val_miou=val_miou,
+            val_loss=val_loss,
+            class_ious=class_ious,
+            num_classes=num_classes,
+            learning_rate=learning_rate,
+            num_epochs=num_epochs,
+            model_name=model_name,
+            image_size=image_size,
+        )
+
         print(
             f"[Epoch {epoch + 1}/{num_epochs}] "
             f"train_loss={train_loss:.4f} "
@@ -240,6 +295,16 @@ def main():
             for class_name, class_iou in zip(CLASS_NAMES, class_ious)
         )
         print(f"class IoU: {class_iou_text}")
+
+        if val_miou > best_miou:
+            best_miou = val_miou
+            checkpoint["best_miou"] = best_miou
+            torch.save(checkpoint, best_checkpoint_path)
+            print(f"New best model saved: {best_checkpoint_path} (val_mIoU={format_metric(val_miou)})")
+
+        checkpoint["best_miou"] = best_miou
+        torch.save(checkpoint, last_checkpoint_path)
+        print(f"Last checkpoint saved: {last_checkpoint_path}")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 dataset/
+oxford_pet_data/
 checkpoints/
 *.pt
 *.pth
