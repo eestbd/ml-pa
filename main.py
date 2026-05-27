@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
+RANDOM_SEED = 42
+
 
 class DoubleConv(nn.Module):
     """Two convolution blocks that preserve spatial resolution."""
@@ -80,18 +82,14 @@ class UNet(nn.Module):
 
 
 class SegmentationLoss(nn.Module):
-    """Loss function for segmentation (e.g., BCE / CrossEntropy / Dice / combined)."""
+    """Cross entropy loss for multi-class semantic segmentation."""
 
     def __init__(self):
         super().__init__()
-        # TODO: define the loss to use
-        #   - BCEWithLogitsLoss for binary segmentation
-        #   - CrossEntropyLoss for multi-class segmentation
-        #   - optionally combine with Dice loss
+        self.loss_fn = nn.CrossEntropyLoss()
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # TODO: compute and return loss from logits and targets
-        raise NotImplementedError
+        return self.loss_fn(logits, targets)
 
 
 class Trainer:
@@ -109,38 +107,88 @@ class Trainer:
         self.optimizer = optimizer
         self.device = device
 
-    def train_one_epoch(self, loader) -> float:
+    def train_one_epoch(self, loader, max_batches=None) -> float:
         self.model.train()
-        # TODO: iterate over (images, masks) batches from loader
-        #   1) move tensors to device
-        #   2) optimizer.zero_grad()
-        #   3) forward -> compute loss
-        #   4) loss.backward() -> optimizer.step()
-        #   5) accumulate and return average loss
-        raise NotImplementedError
+        total_loss = 0.0
+        total_samples = 0
+
+        for batch_idx, (images, masks) in enumerate(loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+
+            images = images.to(self.device, non_blocking=True)
+            masks = masks.to(self.device, non_blocking=True)
+
+            self.optimizer.zero_grad()
+            logits = self.model(images)
+            loss = self.criterion(logits, masks)
+            loss.backward()
+            self.optimizer.step()
+
+            batch_size = images.size(0)
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
+
+        return total_loss / total_samples if total_samples > 0 else 0.0
 
     @torch.no_grad()
-    def validate(self, loader) -> float:
+    def validate(self, loader, max_batches=None) -> float:
         self.model.eval()
-        # TODO: run forward only and compute loss / metrics (IoU, Dice, etc.)
-        raise NotImplementedError
+        total_loss = 0.0
+        total_samples = 0
+
+        for batch_idx, (images, masks) in enumerate(loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+
+            images = images.to(self.device, non_blocking=True)
+            masks = masks.to(self.device, non_blocking=True)
+
+            logits = self.model(images)
+            loss = self.criterion(logits, masks)
+
+            batch_size = images.size(0)
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
+
+        return total_loss / total_samples if total_samples > 0 else 0.0
+
+
+def set_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def main():
+    set_seed(RANDOM_SEED)
+
+    from data import train_loader, val_loader
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_classes = 3
+    num_epochs = 1
+    learning_rate = 1e-4
+    max_train_batches = 5
+    max_val_batches = 2
 
     model = UNet(in_channels=3, num_classes=num_classes).to(device)
-    model.eval()
-
-    dummy = torch.randn(2, 3, 224, 224).to(device)
-    with torch.no_grad():
-        output = model(dummy)
+    criterion = SegmentationLoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    trainer = Trainer(model, criterion, optimizer, device)
 
     trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
-    print(f"input shape: {dummy.shape}")
-    print(f"output shape: {output.shape}")
+    print(f"device: {device}")
     print(f"total trainable parameters: {trainable_params:,}")
+    print(f"num_epochs: {num_epochs}")
+    print(f"learning_rate: {learning_rate}")
+
+    for epoch in range(num_epochs):
+        train_loss = trainer.train_one_epoch(train_loader, max_batches=max_train_batches)
+        val_loss = trainer.validate(val_loader, max_batches=max_val_batches)
+        print(f"[Epoch {epoch + 1}/{num_epochs}] train_loss={train_loss:.4f} val_loss={val_loss:.4f}")
 
 
 if __name__ == "__main__":
