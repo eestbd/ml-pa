@@ -21,6 +21,7 @@ TRAIN_LOG_FIELDNAMES = [
     "loss_type",
     "ce_weight",
     "dice_weight",
+    "ce_class_weights",
     "scheduler",
     "is_best",
 ]
@@ -132,6 +133,7 @@ class SegmentationLoss(nn.Module):
         ce_weight: float = 1.0,
         dice_weight: float = 1.0,
         num_classes: int = 3,
+        ce_class_weights=None,
     ):
         super().__init__()
         if loss_type not in {"ce", "ce_dice"}:
@@ -139,7 +141,7 @@ class SegmentationLoss(nn.Module):
         self.loss_type = loss_type
         self.ce_weight = ce_weight
         self.dice_weight = dice_weight
-        self.ce_loss = nn.CrossEntropyLoss()
+        self.ce_loss = nn.CrossEntropyLoss(weight=ce_class_weights)
         self.dice_loss = DiceLoss(num_classes=num_classes)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -265,6 +267,12 @@ def display_path(path: str) -> str:
     return path.replace("\\", "/")
 
 
+def format_ce_class_weights(weights) -> str:
+    if weights is None:
+        return "None"
+    return "[" + ", ".join(f"{float(weight):.4g}" for weight in weights) + "]"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a basic U-Net for Oxford-IIIT Pet segmentation.")
     parser.add_argument("--epochs", type=int, default=5)
@@ -275,6 +283,13 @@ def parse_args():
     parser.add_argument("--loss", type=str, default="ce_dice", choices=["ce", "ce_dice"])
     parser.add_argument("--ce-weight", type=float, default=1.0)
     parser.add_argument("--dice-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--ce-class-weights",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("FOREGROUND", "BACKGROUND", "BOUNDARY"),
+    )
     parser.add_argument("--scheduler", type=str, default="plateau", choices=["none", "plateau"])
     parser.add_argument("--plateau-factor", type=float, default=0.5)
     parser.add_argument("--plateau-patience", type=int, default=2)
@@ -342,6 +357,7 @@ def build_checkpoint(
     loss_type: str,
     ce_weight: float,
     dice_weight: float,
+    ce_class_weights,
     scheduler_type: str,
     scheduler_state_dict,
     current_lr: float,
@@ -366,6 +382,7 @@ def build_checkpoint(
         "loss_type": loss_type,
         "ce_weight": ce_weight,
         "dice_weight": dice_weight,
+        "ce_class_weights": ce_class_weights,
         "scheduler_type": scheduler_type,
         "scheduler_state_dict": scheduler_state_dict,
         "current_lr": current_lr,
@@ -387,6 +404,7 @@ def append_train_log(
     loss_type: str,
     ce_weight: float,
     dice_weight: float,
+    ce_class_weights,
     scheduler_type: str,
     is_best: bool,
 ) -> None:
@@ -409,6 +427,7 @@ def append_train_log(
                 "loss_type": loss_type,
                 "ce_weight": ce_weight,
                 "dice_weight": dice_weight,
+                "ce_class_weights": format_ce_class_weights(ce_class_weights),
                 "scheduler": scheduler_type,
                 "is_best": is_best,
             }
@@ -427,6 +446,7 @@ def main():
     loss_type = args.loss
     ce_weight = args.ce_weight
     dice_weight = args.dice_weight
+    ce_class_weights = args.ce_class_weights
     scheduler_type = args.scheduler
     model_name = "basic_unet"
     max_train_batches = 5 if args.quick else None
@@ -441,13 +461,18 @@ def main():
     log_path = resolve_log_path(log_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ce_class_weights_tensor = None
+    if ce_class_weights is not None:
+        ce_class_weights_tensor = torch.tensor(ce_class_weights, dtype=torch.float32, device=device)
+
     model = UNet(in_channels=3, num_classes=num_classes).to(device)
     criterion = SegmentationLoss(
         loss_type=loss_type,
         ce_weight=ce_weight,
         dice_weight=dice_weight,
         num_classes=num_classes,
-    )
+        ce_class_weights=ce_class_weights_tensor,
+    ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = build_scheduler(optimizer, args)
     trainer = Trainer(model, criterion, optimizer, device, num_classes=num_classes)
@@ -462,6 +487,7 @@ def main():
     print(f"loss_type: {loss_type}")
     print(f"ce_weight: {ce_weight}")
     print(f"dice_weight: {dice_weight}")
+    print(f"ce_class_weights: {format_ce_class_weights(ce_class_weights)}")
     print(f"scheduler: {scheduler_type}")
     print(f"plateau_factor: {args.plateau_factor}")
     print(f"plateau_patience: {args.plateau_patience}")
@@ -504,6 +530,7 @@ def main():
             loss_type=loss_type,
             ce_weight=ce_weight,
             dice_weight=dice_weight,
+            ce_class_weights=ce_class_weights,
             scheduler_type=scheduler_type,
             scheduler_state_dict=scheduler.state_dict() if scheduler is not None else None,
             current_lr=current_lr,
@@ -549,6 +576,7 @@ def main():
             loss_type=loss_type,
             ce_weight=ce_weight,
             dice_weight=dice_weight,
+            ce_class_weights=ce_class_weights,
             scheduler_type=scheduler_type,
             is_best=is_best,
         )
