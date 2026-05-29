@@ -420,7 +420,6 @@ def main():
     set_seed(RANDOM_SEED)
 
     num_classes = 3
-    image_size = 224
     num_epochs = args.epochs
     learning_rate = args.lr
     checkpoint_dir = args.checkpoint_dir
@@ -472,7 +471,9 @@ def main():
     print(f"log_dir: {display_path(log_dir)}")
     print(f"log_file: {display_path(log_path)}")
 
-    from data import train_loader, val_loader
+    from data import IMAGE_SIZE as DATA_IMAGE_SIZE, train_loader, val_loader
+
+    image_size = DATA_IMAGE_SIZE[0] if isinstance(DATA_IMAGE_SIZE, (tuple, list)) else DATA_IMAGE_SIZE
 
     for epoch in range(num_epochs):
         train_loss = trainer.train_one_epoch(train_loader, max_batches=max_train_batches)

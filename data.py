@@ -1,18 +1,21 @@
 import torch
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
+from pathlib import Path
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset, random_split
 from torchvision import datasets, transforms
 from torchvision.transforms import InterpolationMode
 import torchvision.transforms.functional as TF
 
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 NUM_WORKERS = 4
 PIN_MEMORY = True
 DATA_DIR = "./oxford_pet_data"
 RANDOM_SEED = 42
 USE_TRAIN_AUGMENTATION = True
+VALIDATION_SPLIT_MODE = "random"  # "random" or "breed_holdout"
+HOLDOUT_BREEDS = ()  # Example: ("Abyssinian", "american_bulldog")
 
-IMAGE_SIZE = (224, 224)
-TRAIN_RESIZE_SIZE = (256, 256)
+IMAGE_SIZE = (320, 320)
+TRAIN_RESIZE_SIZE = (384, 384)
 NORMALIZE_MEAN = [0.485, 0.456, 0.406]
 NORMALIZE_STD = [0.229, 0.224, 0.225]
 
@@ -89,6 +92,63 @@ class TransformDataset(Dataset):
         return image, mask
 
 
+def normalize_breed_name(breed_name: str) -> str:
+    return breed_name.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def parse_breed_from_stem(image_stem: str) -> str:
+    return normalize_breed_name(image_stem.rsplit("_", 1)[0])
+
+
+def get_concat_source(concat_dataset: ConcatDataset, index: int):
+    previous_size = 0
+    for dataset, cumulative_size in zip(concat_dataset.datasets, concat_dataset.cumulative_sizes):
+        if index < cumulative_size:
+            return dataset, index - previous_size
+        previous_size = cumulative_size
+    raise IndexError(f"Index {index} out of range for dataset of size {len(concat_dataset)}")
+
+
+def get_image_stem_from_concat(concat_dataset: ConcatDataset, index: int) -> str:
+    dataset, local_index = get_concat_source(concat_dataset, index)
+    image_paths = getattr(dataset, "_images", None)
+    if image_paths is None:
+        raise AttributeError("OxfordIIITPet dataset does not expose the expected '_images' attribute.")
+    return Path(image_paths[local_index]).stem
+
+
+def split_full_dataset(full_dataset: ConcatDataset):
+    if VALIDATION_SPLIT_MODE == "random":
+        total_size = len(full_dataset)
+        train_size = int(0.9 * total_size)
+        val_size = total_size - train_size
+        generator = torch.Generator().manual_seed(RANDOM_SEED)
+        return random_split(full_dataset, [train_size, val_size], generator=generator)
+
+    if VALIDATION_SPLIT_MODE == "breed_holdout":
+        holdout_breeds = {normalize_breed_name(breed) for breed in HOLDOUT_BREEDS}
+        if not holdout_breeds:
+            raise ValueError("HOLDOUT_BREEDS must be non-empty when using breed_holdout split.")
+
+        train_indices = []
+        val_indices = []
+        for index in range(len(full_dataset)):
+            breed = parse_breed_from_stem(get_image_stem_from_concat(full_dataset, index))
+            if breed in holdout_breeds:
+                val_indices.append(index)
+            else:
+                train_indices.append(index)
+
+        if not train_indices or not val_indices:
+            raise ValueError(
+                "breed_holdout split produced an empty train or validation set. "
+                f"Check HOLDOUT_BREEDS={HOLDOUT_BREEDS}."
+            )
+        return Subset(full_dataset, train_indices), Subset(full_dataset, val_indices)
+
+    raise ValueError(f"Unsupported VALIDATION_SPLIT_MODE: {VALIDATION_SPLIT_MODE}")
+
+
 base_trainval_dataset = datasets.OxfordIIITPet(
     root=DATA_DIR,
     split="trainval",
@@ -109,12 +169,7 @@ base_test_dataset = datasets.OxfordIIITPet(
 
 full_dataset = ConcatDataset([base_trainval_dataset, base_test_dataset])
 
-total_size = len(full_dataset)
-train_size = int(0.9 * total_size)
-val_size = total_size - train_size
-
-generator = torch.Generator().manual_seed(RANDOM_SEED)
-train_subset, val_subset = random_split(full_dataset, [train_size, val_size], generator=generator)
+train_subset, val_subset = split_full_dataset(full_dataset)
 
 train_joint_transform = JointTrainTransform() if USE_TRAIN_AUGMENTATION else JointValTransform()
 val_joint_transform = JointValTransform()
