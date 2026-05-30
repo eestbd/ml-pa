@@ -5,7 +5,7 @@ from torchvision import datasets, transforms
 from torchvision.transforms import InterpolationMode
 import torchvision.transforms.functional as TF
 
-BATCH_SIZE = 8
+BATCH_SIZE = 4
 NUM_WORKERS = 4
 PIN_MEMORY = True
 DATA_DIR = "./oxford_pet_data"
@@ -14,8 +14,8 @@ USE_TRAIN_AUGMENTATION = True
 VALIDATION_SPLIT_MODE = "random"  # "random" or "breed_holdout"
 HOLDOUT_BREEDS = ()  # Example: ("Abyssinian", "american_bulldog")
 
-IMAGE_SIZE = (320, 320)
-TRAIN_RESIZE_SIZE = (384, 384)
+IMAGE_SIZE = (384, 384)
+TRAIN_RESIZE_SIZE = (448, 448)
 NORMALIZE_MEAN = [0.485, 0.456, 0.406]
 NORMALIZE_STD = [0.229, 0.224, 0.225]
 
