@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torchvision.models import ResNet34_Weights, resnet34
 
 RANDOM_SEED = 42
 CLASS_NAMES = ("foreground", "background", "boundary")
@@ -99,6 +100,58 @@ class UNet(nn.Module):
         x = self._concat_with_skip(x, x1)
         x = self.decoder1(x)
 
+        return self.final_conv(x)
+
+
+class ResNet34UNet(nn.Module):
+    """U-Net family model with a torchvision ResNet34 classification encoder."""
+
+    def __init__(self, in_channels: int = 3, num_classes: int = 3, encoder_pretrained: bool = False):
+        super().__init__()
+        if in_channels != 3:
+            raise ValueError("ResNet34UNet expects 3-channel RGB input.")
+
+        weights = ResNet34_Weights.DEFAULT if encoder_pretrained else None
+        encoder = resnet34(weights=weights)
+
+        self.stem = nn.Sequential(encoder.conv1, encoder.bn1, encoder.relu)
+        self.maxpool = encoder.maxpool
+        self.layer1 = encoder.layer1
+        self.layer2 = encoder.layer2
+        self.layer3 = encoder.layer3
+        self.layer4 = encoder.layer4
+
+        self.decoder4 = DoubleConv(512 + 256, 256)
+        self.decoder3 = DoubleConv(256 + 128, 128)
+        self.decoder2 = DoubleConv(128 + 64, 64)
+        self.decoder1 = DoubleConv(64 + 64, 64)
+        self.decoder0 = DoubleConv(64 + in_channels, 64)
+        self.final_conv = nn.Conv2d(64, num_classes, kernel_size=1)
+
+    @staticmethod
+    def _upsample_and_concat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        return torch.cat([x, skip], dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_skip = x
+        stem = self.stem(x)
+        x = self.maxpool(stem)
+        layer1 = self.layer1(x)
+        layer2 = self.layer2(layer1)
+        layer3 = self.layer3(layer2)
+        x = self.layer4(layer3)
+
+        x = self._upsample_and_concat(x, layer3)
+        x = self.decoder4(x)
+        x = self._upsample_and_concat(x, layer2)
+        x = self.decoder3(x)
+        x = self._upsample_and_concat(x, layer1)
+        x = self.decoder2(x)
+        x = self._upsample_and_concat(x, stem)
+        x = self.decoder1(x)
+        x = self._upsample_and_concat(x, input_skip)
+        x = self.decoder0(x)
         return self.final_conv(x)
 
 
@@ -275,6 +328,8 @@ def format_ce_class_weights(weights) -> str:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a basic U-Net for Oxford-IIIT Pet segmentation.")
+    parser.add_argument("--model", type=str, default="unet", choices=["unet", "resnet34_unet"])
+    parser.add_argument("--encoder-pretrained", action="store_true")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--quick", action="store_true")
@@ -327,6 +382,14 @@ def get_current_lr(optimizer: optim.Optimizer) -> float:
     return optimizer.param_groups[0]["lr"]
 
 
+def build_model(model_type: str, num_classes: int, encoder_pretrained: bool = False) -> nn.Module:
+    if model_type == "unet":
+        return UNet(in_channels=3, num_classes=num_classes)
+    if model_type == "resnet34_unet":
+        return ResNet34UNet(in_channels=3, num_classes=num_classes, encoder_pretrained=encoder_pretrained)
+    raise ValueError(f"Unsupported model type: {model_type}")
+
+
 def build_scheduler(optimizer: optim.Optimizer, args):
     if args.scheduler == "none":
         return None
@@ -353,6 +416,8 @@ def build_checkpoint(
     learning_rate: float,
     num_epochs: int,
     model_name: str,
+    model_type: str,
+    encoder_pretrained: bool,
     image_size: int,
     loss_type: str,
     ce_weight: float,
@@ -378,6 +443,8 @@ def build_checkpoint(
         "learning_rate": learning_rate,
         "num_epochs": num_epochs,
         "model_name": model_name,
+        "model_type": model_type,
+        "encoder_pretrained": encoder_pretrained,
         "image_size": image_size,
         "loss_type": loss_type,
         "ce_weight": ce_weight,
@@ -443,12 +510,14 @@ def main():
     learning_rate = args.lr
     checkpoint_dir = args.checkpoint_dir
     log_dir = args.log_dir
+    model_type = args.model
+    encoder_pretrained = args.encoder_pretrained
     loss_type = args.loss
     ce_weight = args.ce_weight
     dice_weight = args.dice_weight
     ce_class_weights = args.ce_class_weights
     scheduler_type = args.scheduler
-    model_name = "basic_unet"
+    model_name = "basic_unet" if model_type == "unet" else "resnet34_unet"
     max_train_batches = 5 if args.quick else None
     max_val_batches = 2 if args.quick else None
     mode = "quick debug" if args.quick else "full training"
@@ -465,7 +534,7 @@ def main():
     if ce_class_weights is not None:
         ce_class_weights_tensor = torch.tensor(ce_class_weights, dtype=torch.float32, device=device)
 
-    model = UNet(in_channels=3, num_classes=num_classes).to(device)
+    model = build_model(model_type, num_classes, encoder_pretrained=encoder_pretrained).to(device)
     criterion = SegmentationLoss(
         loss_type=loss_type,
         ce_weight=ce_weight,
@@ -481,6 +550,8 @@ def main():
     trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     print(f"device: {device}")
     print(f"mode: {mode}")
+    print(f"model: {model_type}")
+    print(f"encoder_pretrained: {encoder_pretrained}")
     print(f"total trainable parameters: {trainable_params:,}")
     print(f"num_epochs: {num_epochs}")
     print(f"learning_rate: {learning_rate}")
@@ -526,6 +597,8 @@ def main():
             learning_rate=learning_rate,
             num_epochs=num_epochs,
             model_name=model_name,
+            model_type=model_type,
+            encoder_pretrained=encoder_pretrained,
             image_size=image_size,
             loss_type=loss_type,
             ce_weight=ce_weight,

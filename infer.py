@@ -9,7 +9,7 @@ from PIL import Image
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
-from main import UNet
+from main import build_model
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -26,8 +26,10 @@ def parse_args():
     )
     parser.add_argument("--test-dir", type=str, default="test_images")
     parser.add_argument("--sample", type=str, default="sample_submission.csv")
-    parser.add_argument("--pred-dir", type=str, default="predictions")
-    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--pred-dir", "--out-dir", dest="pred_dir", type=str, default="predictions")
+    parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--model", type=str, default="auto", choices=["auto", "unet", "resnet34_unet"])
+    parser.add_argument("--encoder-pretrained", action="store_true")
     parser.add_argument("--tta-flip", action="store_true")
     return parser.parse_args()
 
@@ -107,6 +109,30 @@ def load_checkpoint(path: Path, device: torch.device):
     return checkpoint
 
 
+def normalize_model_type(model_type):
+    if model_type in (None, "", "basic_unet"):
+        return "unet"
+    if model_type in {"unet", "resnet34_unet"}:
+        return model_type
+    raise ValueError(f"Unsupported checkpoint model type: {model_type}")
+
+
+def resolve_model_type(args, checkpoint):
+    if args.model != "auto":
+        return args.model
+    return normalize_model_type(checkpoint.get("model_type") or checkpoint.get("model_name"))
+
+
+def resolve_image_size(args, checkpoint):
+    if args.image_size is not None:
+        return args.image_size
+
+    checkpoint_image_size = checkpoint.get("image_size", 224)
+    if isinstance(checkpoint_image_size, (tuple, list)):
+        return int(checkpoint_image_size[0])
+    return int(checkpoint_image_size)
+
+
 def predict_logits(model, image_tensor: torch.Tensor, use_tta_flip: bool):
     logits = model(image_tensor)
     if not use_tta_flip:
@@ -155,12 +181,20 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = load_checkpoint(checkpoint_path, device)
-    model = UNet(in_channels=3, num_classes=NUM_CLASSES).to(device)
+    model_type = resolve_model_type(args, checkpoint)
+    image_size = resolve_image_size(args, checkpoint)
+
+    # The checkpoint supplies trained weights, so inference does not need to download ImageNet weights.
+    model = build_model(model_type, NUM_CLASSES, encoder_pretrained=False).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    preprocess = build_preprocess(args.image_size)
+    preprocess = build_preprocess(image_size)
     print(f"Device: {device}")
+    print(f"Model: {model_type}")
+    print(f"Checkpoint encoder_pretrained: {checkpoint.get('encoder_pretrained')}")
+    print(f"CLI encoder_pretrained: {args.encoder_pretrained}")
+    print(f"Image size: {image_size}")
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Prediction dir: {pred_dir}")
     print(f"TTA horizontal flip: {args.tta_flip}")
