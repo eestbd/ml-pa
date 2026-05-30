@@ -176,6 +176,7 @@ val_joint_transform = JointValTransform()
 
 train_set = TransformDataset(train_subset, train_joint_transform)
 val_set = TransformDataset(val_subset, val_joint_transform)
+final_train_set = TransformDataset(full_dataset, train_joint_transform)
 
 train_loader = DataLoader(
     train_set,
@@ -193,6 +194,14 @@ val_loader = DataLoader(
     pin_memory=PIN_MEMORY,
 )
 
+final_train_loader = DataLoader(
+    final_train_set,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=NUM_WORKERS,
+    pin_memory=PIN_MEMORY,
+)
+
 
 if __name__ == "__main__":
     images, masks = next(iter(train_loader))
@@ -201,6 +210,7 @@ if __name__ == "__main__":
     print(f"Total dataset size: {len(full_dataset)}")
     print(f"Train dataset size: {len(train_set)}")
     print(f"Validation dataset size: {len(val_set)}")
+    print(f"Final train dataset size: {len(final_train_set)}")
     print(f"Image batch shape: {images.shape}")
     print(f"Mask batch shape: {masks.shape}")
     print(f"Image dtype: {images.dtype}")

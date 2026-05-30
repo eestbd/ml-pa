@@ -334,6 +334,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to fine-tune from")
     parser.add_argument("--log-dir", type=str, default="logs")
     parser.add_argument("--loss", type=str, default="ce_dice", choices=["ce", "ce_dice"])
     parser.add_argument("--ce-weight", type=float, default=1.0)
@@ -535,6 +536,21 @@ def main():
         ce_class_weights_tensor = torch.tensor(ce_class_weights, dtype=torch.float32, device=device)
 
     model = build_model(model_type, num_classes, encoder_pretrained=encoder_pretrained).to(device)
+    if args.resume is not None:
+        checkpoint = torch.load(args.resume, map_location=device)
+        if isinstance(checkpoint, dict):
+            state_dict = None
+            for key in ("model_state_dict", "state_dict", "model"):
+                if key in checkpoint:
+                    state_dict = checkpoint[key]
+                    break
+            if state_dict is None:
+                state_dict = checkpoint
+        else:
+            state_dict = checkpoint
+
+        model.load_state_dict(state_dict, strict=True)
+        print(f"Loaded resume checkpoint: {display_path(args.resume)}")
     criterion = SegmentationLoss(
         loss_type=loss_type,
         ce_weight=ce_weight,
