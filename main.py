@@ -333,6 +333,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--train-all-final", action="store_true")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to fine-tune from")
     parser.add_argument("--log-dir", type=str, default="logs")
@@ -513,6 +514,7 @@ def main():
     log_dir = args.log_dir
     model_type = args.model
     encoder_pretrained = args.encoder_pretrained
+    train_all_final = args.train_all_final
     loss_type = args.loss
     ce_weight = args.ce_weight
     dice_weight = args.dice_weight
@@ -521,9 +523,10 @@ def main():
     model_name = "basic_unet" if model_type == "unet" else "resnet34_unet"
     max_train_batches = 5 if args.quick else None
     max_val_batches = 2 if args.quick else None
-    mode = "quick debug" if args.quick else "full training"
+    mode = "final train all" if train_all_final else ("quick debug" if args.quick else "full training")
     best_checkpoint_path = os.path.join(checkpoint_dir, "best_unet.pth")
     last_checkpoint_path = os.path.join(checkpoint_dir, "last_unet.pth")
+    final_checkpoint_path = os.path.join(checkpoint_dir, "final_unet.pth")
     log_path = os.path.join(log_dir, f"train_log_{loss_type}_{scheduler_type}.csv")
 
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -584,12 +587,68 @@ def main():
     print(f"log_dir: {display_path(log_dir)}")
     print(f"log_file: {display_path(log_path)}")
 
-    from data import IMAGE_SIZE as DATA_IMAGE_SIZE, train_loader, val_loader
+    from data import IMAGE_SIZE as DATA_IMAGE_SIZE, final_train_loader, train_loader, val_loader
 
     image_size = DATA_IMAGE_SIZE[0] if isinstance(DATA_IMAGE_SIZE, (tuple, list)) else DATA_IMAGE_SIZE
+    active_train_loader = final_train_loader if train_all_final else train_loader
 
     for epoch in range(num_epochs):
-        train_loss = trainer.train_one_epoch(train_loader, max_batches=max_train_batches)
+        train_loss = trainer.train_one_epoch(active_train_loader, max_batches=max_train_batches)
+
+        if train_all_final:
+            current_lr = get_current_lr(optimizer)
+            class_ious = [float("nan")] * num_classes
+            checkpoint = build_checkpoint(
+                epoch=epoch + 1,
+                model=model,
+                optimizer=optimizer,
+                best_miou=best_miou,
+                val_miou=float("nan"),
+                val_loss=float("nan"),
+                class_ious=class_ious,
+                num_classes=num_classes,
+                learning_rate=learning_rate,
+                num_epochs=num_epochs,
+                model_name=model_name,
+                model_type=model_type,
+                encoder_pretrained=encoder_pretrained,
+                image_size=image_size,
+                loss_type=loss_type,
+                ce_weight=ce_weight,
+                dice_weight=dice_weight,
+                ce_class_weights=ce_class_weights,
+                scheduler_type=scheduler_type,
+                scheduler_state_dict=scheduler.state_dict() if scheduler is not None else None,
+                current_lr=current_lr,
+                plateau_factor=args.plateau_factor,
+                plateau_patience=args.plateau_patience,
+                plateau_threshold=args.plateau_threshold,
+                min_lr=args.min_lr,
+            )
+
+            print(f"[Epoch {epoch + 1}/{num_epochs}] train_loss={train_loss:.4f} lr={current_lr:.6f}")
+            torch.save(checkpoint, last_checkpoint_path)
+            print(f"Last checkpoint saved: {display_path(last_checkpoint_path)}")
+            torch.save(checkpoint, final_checkpoint_path)
+            print(f"Final checkpoint saved: {display_path(final_checkpoint_path)}")
+
+            append_train_log(
+                log_path=log_path,
+                epoch=epoch + 1,
+                train_loss=train_loss,
+                val_loss=float("nan"),
+                val_miou=float("nan"),
+                class_ious=class_ious,
+                current_lr=current_lr,
+                loss_type=loss_type,
+                ce_weight=ce_weight,
+                dice_weight=dice_weight,
+                ce_class_weights=ce_class_weights,
+                scheduler_type=scheduler_type,
+                is_best=False,
+            )
+            continue
+
         val_loss, val_miou, class_ious = trainer.validate(val_loader, max_batches=max_val_batches)
         is_best = val_miou > best_miou
         if is_best:
